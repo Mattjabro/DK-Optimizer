@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ortools.linear_solver import pywraplp
 import pandas as pd
+import pulp
 
 
 @dataclass
@@ -14,58 +14,64 @@ class StackSettings:
 
 
 def add_stacking_constraints(
-    solver: pywraplp.Solver,
+    model: pulp.LpProblem,
     pool: pd.DataFrame,
-    x: dict[int, pywraplp.Variable],
+    x: dict[int, pulp.LpVariable],
     settings: StackSettings,
 ):
     """
-    Very simple NFL stacking:
+    NFL stacking rules implemented for PuLP.
 
-      - For each QB selected, require at least
-          `min_wrte_with_qb` WR/TE from same team.
-      - For each QB selected, require at least
-          `min_opp_rb_wr_te` RB/WR/TE from opposing team.
+    For each QB selected:
+      • At least `min_wrte_with_qb` WR/TE from same team
+      • At least `min_opp_rb_wr_te` RB/WR/TE from opponent
 
-    If `enable_qb_stacks` is False, nothing is added.
+    All constraints added via PuLP's:
+        model += (expression >= RHS)
     """
+
     if not settings.enable_qb_stacks:
         return
 
     if settings.min_wrte_with_qb <= 0 and settings.min_opp_rb_wr_te <= 0:
         return
 
-    # We assume columns: Position, TeamAbbrev, Opponent
-    # Opponent is team code of opposing team (e.g. "NYJ").
-    qbs = [row for row in pool.itertuples() if row.Position == "QB"]
+    # Identify QBs
+    qbs = pool[pool["Position"] == "QB"].itertuples()
 
     for qb in qbs:
         qb_pid = qb.player_id
         qb_team = qb.TeamAbbrev
+
+        # If "Opponent" column doesn't exist, skip opponent stacking
         qb_opp = getattr(qb, "Opponent", None)
 
-        # Same-team WR/TE
+        # -------------------------------
+        # SAME TEAM STACKING (WR/TE)
+        # -------------------------------
         if settings.min_wrte_with_qb > 0:
-            same_team_wrte = [
-                row.player_id
-                for row in pool.itertuples()
-                if row.TeamAbbrev == qb_team and row.Position in ("WR", "TE")
+            same_team_wrte = pool[
+                (pool["TeamAbbrev"] == qb_team)
+                & (pool["Position"].isin(["WR", "TE"]))
             ]
-            if same_team_wrte:
-                solver.Add(
-                    sum(x[pid] for pid in same_team_wrte) >=
-                    settings.min_wrte_with_qb * x[qb_pid]
+
+            if len(same_team_wrte) > 0:
+                model += (
+                    pulp.lpSum(x[row.player_id] for row in same_team_wrte.itertuples())
+                    >= settings.min_wrte_with_qb * x[qb_pid]
                 )
 
-        # Opponent RB/WR/TE bring-back
+        # -------------------------------
+        # OPPONENT BRING-BACK
+        # -------------------------------
         if settings.min_opp_rb_wr_te > 0 and qb_opp is not None:
-            opp_skill = [
-                row.player_id
-                for row in pool.itertuples()
-                if row.TeamAbbrev == qb_opp and row.Position in ("RB", "WR", "TE")
+            opp_skill = pool[
+                (pool["TeamAbbrev"] == qb_opp)
+                & (pool["Position"].isin(["RB", "WR", "TE"]))
             ]
-            if opp_skill:
-                solver.Add(
-                    sum(x[pid] for pid in opp_skill) >=
-                    settings.min_opp_rb_wr_te * x[qb_pid]
+
+            if len(opp_skill) > 0:
+                model += (
+                    pulp.lpSum(x[row.player_id] for row in opp_skill.itertuples())
+                    >= settings.min_opp_rb_wr_te * x[qb_pid]
                 )

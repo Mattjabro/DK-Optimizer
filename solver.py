@@ -1,9 +1,8 @@
 # solver.py
 from __future__ import annotations
-
 import numpy as np
 import pandas as pd
-from ortools.linear_solver import pywraplp
+import pulp  # PuLP solver ONLY
 
 from stacks import StackSettings, add_stacking_constraints
 from sims import simulate_points
@@ -19,147 +18,109 @@ def build_lineups(
     stack_settings: StackSettings | None = None,
     use_randomness: bool = True,
     randomness_level: float = 0.6,
-    sim_level: int = 3,  # kept for API compatibility, not used
+    sim_level: int = 3,   # kept for compatibility
     seed: int = 0,
 ):
     """
-    OR-Tools version of your lineup builder.
-
-    Constraints:
-      - Salary between min_salary and max_salary
-      - Exactly 9 players
-      - 1 QB, 1 DST, >=2 RB, >=3 WR, >=1 TE
-      - Exactly 7 RB/WR/TE total (2 RB + 3 WR + 1 TE + 1 FLEX)
-      - Max players per team
-      - Stacking rules via StackSettings
-      - Min difference between lineups (min_diff_players_between_lineups)
-      - Optional Monte Carlo randomness for projections
+    DK NFL optimizer using PuLP (CBC).
+    Works on Streamlit Cloud.
     """
+
     if stack_settings is None:
         stack_settings = StackSettings()
 
-    # Clean pool
+    # Prep pool
     pool = player_pool.copy()
     pool = pool[pool["ppg_projection"].notna()].copy()
     pool = pool.reset_index(drop=False).rename(columns={"index": "player_id"})
 
     rng = np.random.default_rng(seed)
 
-    lineups: list[pd.DataFrame] = []
-    used_set_list: list[list[int]] = []
+    lineups = []
+    used_sets = []   # store player_id lists for uniqueness
 
     for ln in range(n_lineups):
-        # -------------------------------------------------
-        #  Simulated (or deterministic) objective vector
-        # -------------------------------------------------
+
+        # -------------------------------------
+        # Randomized projections (Monte-Carlo)
+        # -------------------------------------
         if use_randomness and randomness_level > 0:
-            sim_vec = simulate_points(pool, randomness_level=randomness_level, rng=rng)
-            pool["sim_points"] = sim_vec
-            objective_vec = pool["sim_points"].astype(float).values
+            sims = simulate_points(pool, randomness_level=randomness_level, rng=rng)
+            pool["sim_points"] = sims
+            obj_vec = pool["sim_points"].astype(float).values
         else:
-            objective_vec = pool["ppg_projection"].astype(float).values
+            obj_vec = pool["ppg_projection"].astype(float).values
 
-        # -------------------------------------------------
-        #  OR-Tools solver setup (CBC)
-        # -------------------------------------------------
-        solver = pywraplp.Solver.CreateSolver("CBC_MIXED_INTEGER_PROGRAMMING")
-        if solver is None:
-            raise RuntimeError("Could not create OR-Tools CBC solver.")
+        # -------------------------------------
+        # Create PuLP MILP model
+        # -------------------------------------
+        model = pulp.LpProblem(f"DK_Lineup_{ln}", pulp.LpMaximize)
 
-        # Decision vars: x[player_id] ∈ {0, 1}
-        x: dict[int, pywraplp.Variable] = {}
-        for row in pool.itertuples():
-            x[row.player_id] = solver.BoolVar(f"x_{row.player_id}")
+        # Binary decision vars
+        x = {
+            row.player_id: pulp.LpVariable(f"x_{row.player_id}", 0, 1, pulp.LpBinary)
+            for row in pool.itertuples()
+        }
 
-        # -------------------------------------------------
-        #  Objective: maximize total projected/simulated points
-        # -------------------------------------------------
-        objective = solver.Objective()
-        for i, row in enumerate(pool.itertuples()):
-            pid = row.player_id
-            objective.SetCoefficient(x[pid], float(objective_vec[i]))
-        objective.SetMaximization()
+        # Objective
+        model += pulp.lpSum(obj_vec[i] * x[row.player_id]
+                            for i, row in enumerate(pool.itertuples()))
 
-        # -------------------------------------------------
-        #  Salary constraints
-        # -------------------------------------------------
-        salary_expr = solver.Sum(row.Salary * x[row.player_id] for row in pool.itertuples())
-        solver.Add(salary_expr <= max_salary)
-        solver.Add(salary_expr >= min_salary)
+        # Salary constraints
+        model += pulp.lpSum(row.Salary * x[row.player_id] for row in pool.itertuples()) <= max_salary
+        model += pulp.lpSum(row.Salary * x[row.player_id] for row in pool.itertuples()) >= min_salary
 
-        # -------------------------------------------------
-        #  Roster size = 9
-        # -------------------------------------------------
-        solver.Add(solver.Sum(x[row.player_id] for row in pool.itertuples()) == 9)
+        # Roster size = 9
+        model += pulp.lpSum(x[row.player_id] for row in pool.itertuples()) == 9
 
-        # -------------------------------------------------
-        #  Position constraints
-        # -------------------------------------------------
-        def pos_sum(pos: str):
-            return solver.Sum(
-                x[row.player_id] for row in pool.itertuples() if row.Position == pos
-            )
+        # Position helper
+        def pos_sum(pos):
+            return pulp.lpSum(x[row.player_id]
+                              for row in pool.itertuples()
+                              if row.Position == pos)
 
-        # Exact
-        solver.Add(pos_sum("QB") == 1)
-        solver.Add(pos_sum("DST") == 1)
+        # Exact position requirements
+        model += pos_sum("QB") == 1
+        model += pos_sum("DST") == 1
 
         # Minimums
-        solver.Add(pos_sum("RB") >= 2)
-        solver.Add(pos_sum("WR") >= 3)
-        solver.Add(pos_sum("TE") >= 1)
+        model += pos_sum("RB") >= 2
+        model += pos_sum("WR") >= 3
+        model += pos_sum("TE") >= 1
 
-        # FLEX rule: total RB/WR/TE = 7 (2 RB, 3 WR, 1 TE, 1 FLEX)
-        solver.Add(
-            solver.Sum(
+        # FLEX: total RB/WR/TE must be exactly 7
+        model += pulp.lpSum(
+            x[row.player_id]
+            for row in pool.itertuples()
+            if row.Position in ("RB", "WR", "TE")
+        ) == 7
+
+        # Max per team
+        for team in pool["TeamAbbrev"].unique():
+            model += pulp.lpSum(
                 x[row.player_id]
                 for row in pool.itertuples()
-                if row.Position in ("RB", "WR", "TE")
-            )
-            == 7
-        )
+                if row.TeamAbbrev == team
+            ) <= max_players_per_team
 
-        # -------------------------------------------------
-        #  Max per team
-        # -------------------------------------------------
-        for team in pool["TeamAbbrev"].unique():
-            solver.Add(
-                solver.Sum(
-                    x[row.player_id]
-                    for row in pool.itertuples()
-                    if row.TeamAbbrev == team
-                )
-                <= max_players_per_team
-            )
+        # Stacking rules
+        add_stacking_constraints(model, pool, x, stack_settings)
 
-        # -------------------------------------------------
-        #  Stacking constraints
-        # -------------------------------------------------
-        add_stacking_constraints(solver, pool, x, stack_settings)
-
-        # -------------------------------------------------
-        #  Uniqueness between lineups
-        # -------------------------------------------------
+        # Uniqueness: overlap <= 9 - min_diff
         max_overlap = 9 - min_diff_players_between_lineups
-        for prev_ids in used_set_list:
-            solver.Add(
-                solver.Sum(x[pid] for pid in prev_ids) <= max_overlap
-            )
+        for prev in used_sets:
+            model += pulp.lpSum(x[pid] for pid in prev) <= max_overlap
 
-        # -------------------------------------------------
-        #  Solve ILP
-        # -------------------------------------------------
-        status = solver.Solve()
-        if status != pywraplp.Solver.OPTIMAL:
-            # No more feasible lineups under current constraints
-            break
+        # Solve with PuLP’s CBC solver
+        status = model.solve(pulp.PULP_CBC_CMD(msg=False))
 
-        chosen_ids = [
-            pid for pid, var in x.items() if var.solution_value() > 0.5
-        ]
-        used_set_list.append(chosen_ids)
+        if pulp.LpStatus[status] != "Optimal":
+            break  # No more feasible solutions
 
-        lu = pool[pool["player_id"].isin(chosen_ids)].copy()
-        lineups.append(lu)
+        chosen = [pid for pid, var in x.items() if var.value() == 1]
+        used_sets.append(chosen)
+
+        lineup = pool[pool["player_id"].isin(chosen)].copy()
+        lineups.append(lineup)
 
     return lineups
